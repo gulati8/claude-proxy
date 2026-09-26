@@ -31,7 +31,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import SpanLimits, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.trace import Status, StatusCode
+from opentelemetry.trace import NonRecordingSpan, SpanContext, Status, StatusCode
 
 CAPTURE_DIR = Path(os.environ.get("CLAUDE_PROXY_CAPTURE_DIR", "~/.claude-proxy/captures")).expanduser()
 STORE_MODE = os.environ.get("CLAUDE_PROXY_STORE", "full")  # full | dedupe
@@ -354,6 +354,71 @@ def _safe(s: str) -> str:
 
 # ----------------------------------------------------------------------------- phoenix
 
+# Tree shape in Phoenix. Every HTTP call is independent on the wire: Claude Code sends a
+# session id and, on sub-agent calls, an agent id, but nothing that says which call
+# launched the agent. The tree is rebuilt here from what the calls contain:
+#   - main (and side) calls are top-level rows.
+#   - when a response contains a tool call carrying a task brief as `input.prompt` (the
+#     Agent tool), that prompt is remembered against the call's span.
+#   - a sub-agent's first call opens with that same brief verbatim in its first message.
+#     Matching the text identifies the launching call exactly. Every call that agent makes
+#     is then parented directly to that launching call, as siblings, never to each other.
+#   - a sub-agent that launches its own sub-agent is handled the same way, one level down.
+# A sub-agent whose launching call was never seen (proxy started mid-session, or the
+# race where the first sub-agent request lands before the parent's span is emitted) is
+# top-level for that call, marked `claude.spawned_by = "unmatched"`, and is re-tried on
+# its later calls since the first message stays the same.
+
+
+@dataclass
+class _SessionState:
+    agent_parent: dict = field(default_factory=dict)  # agent_id -> SpanContext of the launching call
+    pending_spawns: list = field(default_factory=list)  # [(prompt_text, SpanContext)] not yet claimed
+
+
+_sessions: dict[str, _SessionState] = {}
+_MAX_PENDING_SPAWNS = 200  # per session; oldest unclaimed spawn is dropped past this
+_MIN_SPAWN_PROMPT_LEN = 40  # shorter prompts are too likely to appear by coincidence
+
+
+def _plain_text(content: Any) -> str:
+    """Text blocks of an Anthropic message `content`; other block types are skipped."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _spawn_prompts(content: Any) -> list[str]:
+    """`input.prompt` of every tool call in an assistant response. The Agent tool hands
+    the new agent its whole brief this way; the brief reappears in that agent's first call."""
+    if not isinstance(content, list):
+        return []
+    out = []
+    for b in content:
+        if isinstance(b, dict) and b.get("type") in ("tool_use", "server_tool_use", "mcp_tool_use"):
+            p = (b.get("input") or {}).get("prompt")
+            if isinstance(p, str) and len(p) >= _MIN_SPAWN_PROMPT_LEN:
+                out.append(p)
+    return out
+
+
+def _launching_call(sess: _SessionState, agent_id: str, req: Any) -> Optional[SpanContext]:
+    """Span of the call that launched `agent_id`, or None if it was never seen."""
+    if agent_id in sess.agent_parent:
+        return sess.agent_parent[agent_id]
+    if not isinstance(req, dict):
+        return None
+    msgs = req.get("messages") or []
+    first_text = _plain_text(msgs[0].get("content")) if msgs and isinstance(msgs[0], dict) else ""
+    for i, (prompt, ctx) in enumerate(sess.pending_spawns):
+        if prompt in first_text:
+            del sess.pending_spawns[i]
+            sess.agent_parent[agent_id] = ctx
+            return ctx
+    return None
+
 
 def _emit_span(cap: Capture, resp: dict, ended_ns: int) -> None:
     if _tracer is None:
@@ -361,9 +426,14 @@ def _emit_span(cap: Capture, resp: dict, ended_ns: int) -> None:
     req = cap.request
     meta = cap.meta
     model = req.get("model") if isinstance(req, dict) else None
+
+    sess = _sessions.setdefault(meta.get("session_id") or "no-session", _SessionState())
+    agent_id = meta.get("agent_id")
+    parent_ctx = _launching_call(sess, agent_id, req) if meta["call_class"] == "subagent" and agent_id else None
     span = _tracer.start_span(
         name=f"{meta['call_class']}: {resp.get('model') or model or 'unknown'}",
         start_time=cap.started_ns,
+        context=trace.set_span_in_context(NonRecordingSpan(parent_ctx)) if parent_ctx else None,
     )
     a: dict = {
         SpanAttributes.OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKindValues.LLM.value,
@@ -383,6 +453,8 @@ def _emit_span(cap: Capture, resp: dict, ended_ns: int) -> None:
         "claude.compaction_beta": any(b.startswith("compact-") for b in meta["anthropic_beta"]),
         "claude.has_compaction_block": meta.get("has_compaction_block", False),
     }
+    if meta["call_class"] == "subagent" and agent_id:
+        a["claude.spawned_by"] = "matched" if parent_ctx else "unmatched"
     for k, key in (("session_id", SpanAttributes.SESSION_ID), ("agent_id", "claude.agent_id"),
                    ("parent_agent_id", "claude.parent_agent_id"), ("request_id", "claude.request_id"),
                    ("error", "claude.error")):
@@ -435,6 +507,14 @@ def _emit_span(cap: Capture, resp: dict, ended_ns: int) -> None:
     else:
         span.set_status(Status(StatusCode.OK))
     span.end(end_time=ended_ns)
+
+    # Remember any agent briefs this response handed out, so the agents they launch can
+    # be parented to this call when their first request arrives.
+    spawned = _spawn_prompts(resp.get("content"))
+    if spawned:
+        ctx = span.get_span_context()
+        sess.pending_spawns.extend((p, ctx) for p in spawned)
+        del sess.pending_spawns[: max(0, len(sess.pending_spawns) - _MAX_PENDING_SPAWNS)]
 
 
 def _msg_attrs(a: dict, prefix: str, i: int, m: dict) -> None:

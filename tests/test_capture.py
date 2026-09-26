@@ -220,5 +220,109 @@ class SpanAttributes(unittest.TestCase):
         self.assertEqual(json.loads(a["llm.output_messages.0.message.tool_calls.0.tool_call.function.arguments"]), {"command": "ls"})
 
 
+class SpanTree(unittest.TestCase):
+    """Phoenix tree shape: main calls are roots; every call a sub-agent makes is a direct
+    child of the call that launched it, matched by the launch prompt in its first message."""
+
+    BRIEF = "You are implementing Task 1: config plumbing. Read the brief at /tmp/task1.md and follow it exactly."
+
+    def setUp(self):
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        self.tmp = tempfile.TemporaryDirectory()
+        capture.CAPTURE_DIR = Path(self.tmp.name)
+        self.exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(self.exporter))
+        self._old = (capture._tracer, dict(capture._sessions))
+        capture._tracer = provider.get_tracer("test")
+        capture._sessions.clear()
+
+    def tearDown(self):
+        capture._tracer, saved = self._old
+        capture._sessions.clear(); capture._sessions.update(saved)
+        self.tmp.cleanup()
+
+    def call(self, *, agent_id=None, first_text="hello", response_content=None, session="sess1"):
+        """Run one request through begin/finish and return its exported span."""
+        hdrs = {"X-Claude-Code-Session-Id": session}
+        if agent_id:
+            hdrs["x-claude-code-agent-id"] = agent_id
+        req = {"model": "claude-fable-5-1", "tools": [{"name": "Bash"}],
+               "messages": [{"role": "user", "content": [{"type": "text", "text": f"<system-reminder>\nstuff\n</system-reminder>\n{first_text}"}]}]}
+        resp = {"id": "msg", "type": "message", "role": "assistant", "model": "claude-fable-5-1",
+                "content": response_content or [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "usage": {}}
+        before = len(self.exporter.get_finished_spans())
+        cap = capture.begin("POST", "/v1/messages", hdrs, json.dumps(req).encode())
+        capture.finish(cap, 200, {"content-type": "application/json"}, json.dumps(resp).encode())
+        spans = self.exporter.get_finished_spans()
+        self.assertEqual(len(spans), before + 1)
+        return spans[-1]
+
+    def launch_response(self, brief):
+        return [{"type": "text", "text": "Delegating."},
+                {"type": "tool_use", "id": "toolu_1", "name": "Agent", "input": {"description": "do task 1", "prompt": brief}}]
+
+    def test_main_calls_are_roots_and_not_chained(self):
+        m1 = self.call(first_text="first turn")
+        m2 = self.call(first_text="second turn")
+        self.assertIsNone(m1.parent)
+        self.assertIsNone(m2.parent)
+        self.assertNotEqual(m1.context.trace_id, m2.context.trace_id)
+
+    def test_subagent_calls_are_siblings_under_launching_call(self):
+        parent = self.call(response_content=self.launch_response(self.BRIEF))
+        b1 = self.call(agent_id="agentB", first_text=self.BRIEF)
+        b2 = self.call(agent_id="agentB", first_text=self.BRIEF)
+        b3 = self.call(agent_id="agentB", first_text=self.BRIEF)
+        for b in (b1, b2, b3):
+            self.assertEqual(b.parent.span_id, parent.context.span_id)  # direct child of the launcher
+            self.assertEqual(b.context.trace_id, parent.context.trace_id)  # same tree in Phoenix
+            self.assertEqual(b.attributes["claude.spawned_by"], "matched")
+        self.assertNotEqual(b2.parent.span_id, b1.context.span_id)  # not chained to each other
+
+    def test_two_agents_from_one_call_each_matched_to_it(self):
+        other = "You are implementing Task 2: the migration. Read /tmp/task2.md and follow it exactly."
+        parent = self.call(response_content=self.launch_response(self.BRIEF) + self.launch_response(other))
+        b = self.call(agent_id="agentB", first_text=self.BRIEF)
+        c = self.call(agent_id="agentC", first_text=other)
+        self.assertEqual(b.parent.span_id, parent.context.span_id)
+        self.assertEqual(c.parent.span_id, parent.context.span_id)
+
+    def test_nested_subagent_parents_to_the_subagent_call_that_launched_it(self):
+        inner = "You are a reviewer. Check the diff in /tmp/diff.patch and report problems only."
+        top = self.call(response_content=self.launch_response(self.BRIEF))
+        b1 = self.call(agent_id="agentB", first_text=self.BRIEF)
+        b2 = self.call(agent_id="agentB", first_text=self.BRIEF, response_content=self.launch_response(inner))
+        d1 = self.call(agent_id="agentD", first_text=inner)
+        self.assertEqual(b2.parent.span_id, top.context.span_id)
+        self.assertEqual(d1.parent.span_id, b2.context.span_id)  # one level down, under B's 2nd call
+        self.assertEqual(d1.context.trace_id, top.context.trace_id)
+
+    def test_unmatched_subagent_is_root_and_flagged(self):
+        s = self.call(agent_id="agentX", first_text="a brief this proxy never saw handed out")
+        self.assertIsNone(s.parent)
+        self.assertEqual(s.attributes["claude.spawned_by"], "unmatched")
+
+    def test_unmatched_first_call_is_retried_on_later_calls(self):
+        # Race: the agent's first request landed before the launcher's span was emitted.
+        first = self.call(agent_id="agentB", first_text=self.BRIEF)
+        parent = self.call(response_content=self.launch_response(self.BRIEF))
+        second = self.call(agent_id="agentB", first_text=self.BRIEF)
+        self.assertIsNone(first.parent)
+        self.assertEqual(second.parent.span_id, parent.context.span_id)
+
+    def test_short_prompts_are_not_treated_as_launches(self):
+        parent = self.call(response_content=[{"type": "tool_use", "id": "t", "name": "WebSearch", "input": {"prompt": "chase login"}}])
+        s = self.call(agent_id="agentZ", first_text="chase login")
+        self.assertIsNone(s.parent)
+
+    def test_sessions_do_not_cross(self):
+        self.call(response_content=self.launch_response(self.BRIEF), session="s1")
+        s = self.call(agent_id="agentB", first_text=self.BRIEF, session="s2")
+        self.assertIsNone(s.parent)
+
+
 if __name__ == "__main__":
     unittest.main()
