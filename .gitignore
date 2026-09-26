@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Proxy output. Defaults live in ~/.claude-proxy/, outside the repo; these guard
+# against CLAUDE_PROXY_CAPTURE_DIR ever pointing inside it or logs landing here.
+captures/
+.claude-proxy/
+*.log
+
+# Local secrets and per-machine config
+.env
+.env.*
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Machine-specific service definitions (launchd, systemd, etc.)
+*.plist
+*.service
