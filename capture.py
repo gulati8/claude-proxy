@@ -36,7 +36,7 @@ from opentelemetry.trace import Status, StatusCode
 CAPTURE_DIR = Path(os.environ.get("CLAUDE_PROXY_CAPTURE_DIR", "~/.claude-proxy/captures")).expanduser()
 STORE_MODE = os.environ.get("CLAUDE_PROXY_STORE", "full")  # full | dedupe
 PHOENIX_ENDPOINT = os.environ.get("CLAUDE_PROXY_PHOENIX", "http://localhost:6006/v1/traces")  # "" disables
-PROJECT_NAME = os.environ.get("CLAUDE_PROXY_PROJECT", "claude-code")
+PROJECT_NAME = os.environ.get("CLAUDE_PROXY_PROJECT", "claude-proxy")
 
 # Never written to disk or to Phoenix.
 SECRET_HEADERS = {"authorization", "x-api-key", "cookie", "proxy-authorization"}

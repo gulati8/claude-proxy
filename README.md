@@ -52,7 +52,7 @@ To skip the proxy for one session: `ANTHROPIC_BASE_URL=https://api.anthropic.com
 | What | Where |
 |---|---|
 | One JSON file per call | `~/.claude-proxy/captures/<session-id>/<timestamp>-<n>.json` |
-| Phoenix spans (optional) | project `claude-code` at `http://localhost:6006` |
+| Phoenix spans (optional) | project `claude-proxy` at `http://localhost:6006` |
 
 Each capture file has three parts:
 
@@ -73,7 +73,7 @@ response  the reassembled message: content blocks, stop_reason, usage
 | `CLAUDE_PROXY_CAPTURE_DIR` | `~/.claude-proxy/captures` | Where capture files go |
 | `CLAUDE_PROXY_STORE` | `full` | `full` stores the whole request per call. `dedupe` stores `system` and `tools` once per session. |
 | `CLAUDE_PROXY_PHOENIX` | `http://localhost:6006/v1/traces` | Phoenix endpoint. Set to an empty string to disable. |
-| `CLAUDE_PROXY_PROJECT` | `claude-code` | Phoenix project name |
+| `CLAUDE_PROXY_PROJECT` | `claude-proxy` | Phoenix project name |
 
 ## Tests
 
